@@ -1,57 +1,64 @@
-import { ParsedPage } from './parser';
+import fs from 'fs/promises';
+import path from 'path';
+import pdfParse from 'pdf-parse';
 
-export type Chunk = { content: string; page?: number; heading?: string };
+export type ParsedPage = { page: number; text: string };
 
-// PostgreSQL text columns cannot store NUL (\u0000) characters, which PDF
-// extraction often produces. Also collapse extra spaces.
-function clean(text: string): string {
-  return text
-    .replace(/\u0000/g, '')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n{3,}/g, '\n\n');
-}
+/**
+ * Parse an uploaded file into a list of pages.
+ *
+ * Detection order:
+ *  1. File extension (.pdf → PDF parser, .txt/.md/.markdown → plain text)
+ *  2. Magic bytes — if the extension is absent or unrecognised, peek at the
+ *     first 4 bytes: `%PDF` → PDF parser, anything else → plain text.
+ *
+ * Multer saves uploaded files with a random hash as the filename and no
+ * extension, so magic-byte detection is the common path for real uploads.
+ */
+export async function parseFile(filePath: string): Promise<ParsedPage[]> {
+  const ext = path.extname(filePath).toLowerCase();
 
-// Split text into windows of about `size` characters, breaking at a space
-// when one is nearby, with `overlap` characters shared between neighbours.
-function windowText(text: string, size: number, overlap: number): string[] {
-  const pieces: string[] = [];
-  let start = 0;
+  if (ext === '.pdf') return parsePdf(filePath);
+  if (ext === '.txt' || ext === '.md' || ext === '.markdown') return parsePlainText(filePath);
 
-  while (start < text.length) {
-    let end = Math.min(start + size, text.length);
-
-    if (end < text.length) {
-      const lastSpace = text.lastIndexOf(' ', end);
-      if (lastSpace > start + size / 2) end = lastSpace;
-    }
-
-    const piece = text.slice(start, end).trim();
-    if (piece) pieces.push(piece);
-
-    if (end >= text.length) break;
-    start = Math.max(end - overlap, start + 1);
+  // No recognised extension — detect by magic bytes
+  const header = Buffer.alloc(4);
+  const fh = await fs.open(filePath, 'r');
+  try {
+    await fh.read(header, 0, 4, 0);
+  } finally {
+    await fh.close();
   }
 
-  return pieces;
+  if (header.toString('ascii') === '%PDF') return parsePdf(filePath);
+  return parsePlainText(filePath);
 }
 
-export function chunkPages(pages: ParsedPage[], size = 1000, overlap = 150): Chunk[] {
-  const chunks: Chunk[] = [];
+async function parsePlainText(filePath: string): Promise<ParsedPage[]> {
+  const text = await fs.readFile(filePath, 'utf-8');
+  return [{ page: 1, text }];
+}
 
-  for (const page of pages) {
-    const text = clean(page.text);
+async function parsePdf(filePath: string): Promise<ParsedPage[]> {
+  const buffer = await fs.readFile(filePath);
+  const pages: ParsedPage[] = [];
 
-    // Most recent markdown heading on this page (approximate for citations)
-    let heading: string | undefined;
-    for (const line of text.split('\n')) {
-      const match = line.match(/^#{1,6}\s+(.*)$/);
-      if (match) heading = match[1].trim();
-    }
+  // pdf-parse callback fires once per page; collect them in order
+  await pdfParse(buffer, {
+    pagerender(pageData: any) {
+      return pageData.getTextContent().then((content: any) => {
+        const text: string = content.items.map((item: any) => item.str).join(' ');
+        pages.push({ page: pageData.pageIndex + 1, text });
+        return text;
+      });
+    },
+  });
 
-    for (const piece of windowText(text, size, overlap)) {
-      chunks.push({ content: piece, page: page.page, heading });
-    }
+  // Fallback: custom render produced nothing (some PDFs have no text layer)
+  if (pages.length === 0) {
+    const data = await pdfParse(buffer);
+    return [{ page: 1, text: data.text }];
   }
 
-  return chunks;
+  return pages;
 }

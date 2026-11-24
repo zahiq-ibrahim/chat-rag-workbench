@@ -16,7 +16,11 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ok = ALLOWED.includes(path.extname(file.originalname).toLowerCase());
-    cb(ok ? null : new Error('Only .pdf, .md, .markdown and .txt files are allowed'), ok);
+    if (ok) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only .pdf, .md, .markdown and .txt files are allowed'));
+    }
   },
 });
 
@@ -24,13 +28,29 @@ const upload = multer({
 documentRouter.post('/', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Missing file field "file"' });
 
-  const { rows } = await pool.query(
-    `INSERT INTO documents (name, mime_type, file_path, status)
-     VALUES ($1, $2, $3, 'queued') RETURNING *`,
-    [req.file.originalname, req.file.mimetype, req.file.path]
-  );
+  let rows: any[];
+  try {
+    const result = await pool.query(
+      `INSERT INTO documents (name, mime_type, file_path, status)
+       VALUES ($1, $2, $3, 'queued') RETURNING *`,
+      [req.file.originalname, req.file.mimetype, req.file.path]
+    );
+    rows = result.rows;
+  } catch (err) {
+    // DB insert failed — remove the orphaned upload from disk
+    await fs.unlink(req.file.path).catch(() => {});
+    throw err;
+  }
 
-  await enqueueIngestion(rows[0].id);
+  try {
+    await enqueueIngestion(rows[0].id);
+  } catch (err) {
+    // Queue push failed — roll back the document row and remove the file
+    await pool.query('DELETE FROM documents WHERE id = $1', [rows[0].id]).catch(() => {});
+    await fs.unlink(req.file.path).catch(() => {});
+    throw err;
+  }
+
   res.status(202).json(rows[0]);
 });
 

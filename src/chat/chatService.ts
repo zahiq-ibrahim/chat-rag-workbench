@@ -1,4 +1,4 @@
-import { generateText, tool, jsonSchema } from 'ai';
+import { generateText, tool, jsonSchema, isStepCount } from 'ai';
 import { pool } from '../db/pool';
 import { chatModel } from '../ai/gemini';
 import { retrieve } from '../rag/retriever';
@@ -46,7 +46,9 @@ export async function answer(chatId: string, userText: string) {
       t.name,
       tool({
         description: t.description,
-        inputSchema: jsonSchema(t.parameters),
+        // Cast to Record<string, unknown> so the Schema type resolves to a concrete
+        // INPUT instead of `unknown`, satisfying the tool() overload check.
+        inputSchema: jsonSchema<Record<string, unknown>>(t.parameters),
         execute: async (args: Record<string, unknown>) => {
           try {
             return await runTool(t, args);
@@ -58,7 +60,7 @@ export async function answer(chatId: string, userText: string) {
     ])
   );
 
-  // 5. Generate. The SDK runs the tool loop up to MAX_STEPS.
+  // 5. Generate. In AI SDK v7 maxSteps was replaced by stopWhen + isStepCount.
   const { text, steps } = await generateText({
     model: chatModel,
     system: SYSTEM_PROMPT,
@@ -73,7 +75,7 @@ export async function answer(chatId: string, userText: string) {
       },
     ],
     tools,
-    maxSteps: MAX_STEPS,
+    stopWhen: isStepCount(MAX_STEPS),
   });
 
   const toolCalls = steps.flatMap((s) =>

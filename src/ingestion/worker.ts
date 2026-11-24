@@ -7,10 +7,9 @@ import { chunkPages } from './chunker';
 import { embedTexts } from '../ai/gemini';
 import { INGESTION_QUEUE } from './queue';
 
-// Free tier allows about 30,000 embedding tokens per minute.
-// Keep batches small and pause between them.
-const EMBED_BATCH_SIZE = 10;
-const PAUSE_BETWEEN_BATCHES_MS = 4000;
+// Free-tier limits: ~1,500 RPM and ~100 texts per embedMany call.
+// Don't pre-emptively sleep — only back off when the API actually says 429.
+const EMBED_BATCH_SIZE = 100;
 const RATE_LIMIT_WAIT_MS = 65000;
 const MAX_RATE_LIMIT_RETRIES = 5;
 
@@ -75,11 +74,6 @@ const worker = new Worker(
       for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
         const batch = chunks.slice(i, i + EMBED_BATCH_SIZE).map((c) => c.content);
         vectors.push(...(await embedWithRetry(batch)));
-
-        // Pause between batches so bursts stay under the per-minute limit
-        if (i + EMBED_BATCH_SIZE < chunks.length) {
-          await sleep(PAUSE_BETWEEN_BATCHES_MS);
-        }
       }
 
       // Replace old chunks and write new ones in one transaction.
@@ -119,8 +113,12 @@ const worker = new Worker(
       }
     } catch (err: any) {
       // Record the real error on the document so the status endpoint shows it
-      await setStatus(documentId, 'failed', err.message ?? 'Unknown error');
-      // Do not rethrow: BullMQ retries would just hit the quota again
+      await setStatus(documentId, 'failed', err.message ?? 'Unknown error').catch(() => {});
+      // Only swallow rate-limit errors — retrying quota failures immediately is pointless.
+      // All other errors are rethrown so BullMQ can retry the job via its backoff policy.
+      if (!isRateLimitError(err)) {
+        throw err;
+      }
     }
   },
   { connection, concurrency: 1 }
